@@ -105,17 +105,268 @@ jobs:
             build
 
       - name: Stage binaries and package unsigned IPA
+        shell: python3 {0}
         run: |
-          APP_PATH=$(find build/ios-xcode/Build/Products/Release-iphoneos -maxdepth 2 -name "*.app" -print -quit)
-          echo "Found XcodeGen app bundle: $APP_PATH"
-          mkdir -p "$APP_PATH/Frameworks"
+          import glob
+          import os
+          import plistlib
+          import shutil
+          import subprocess
+          import sys
 
-          BUILT_BIN=$(find build/ios-vulkan -type f \( -name "GeneralsXZH" -o -name "z_generals" \) -print -quit)
-          EXEC_NAME=""
-          if val=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null); then
-            EXEC_NAME="$val"
-          fi
-          if [ -z "$EXEC_NAME" ]; then
-            EXEC_NAME="GeneralsXZH"
-          fi
-          echo "Staging binary $BUILT_BIN to
+          def run(cmd, check=True, capture=False):
+              if capture:
+                  res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                  if check and res.returncode != 0:
+                      print(res.stdout)
+                      sys.exit(res.returncode)
+                  return res.stdout
+              res = subprocess.run(cmd)
+              if check and res.returncode != 0:
+                  sys.exit(res.returncode)
+              return ""
+
+          def safe_copy(src, dst):
+              if os.path.lexists(dst):
+                  os.unlink(dst)
+              shutil.copyfile(src, dst)
+
+          apps = glob.glob("build/ios-xcode/Build/Products/Release-iphoneos/*.app")
+          if not apps:
+              apps = glob.glob("build/ios-xcode/Build/Products/Release-iphoneos/*/*.app")
+          if not apps:
+              print("ERROR: Could not find .app bundle")
+              sys.exit(1)
+          app_path = apps[0]
+          print("Found XcodeGen app bundle:", app_path)
+          fw_dir = os.path.join(app_path, "Frameworks")
+          os.makedirs(fw_dir, exist_ok=True)
+
+          built_bin = None
+          for root, dirs, files in os.walk("build/ios-vulkan"):
+              for fn in files:
+                  if fn in ("GeneralsXZH", "z_generals"):
+                      cand = os.path.join(root, fn)
+                      if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                          built_bin = cand
+                          break
+              if built_bin:
+                  break
+
+          if not built_bin:
+              print("ERROR: Could not find built binary")
+              sys.exit(1)
+
+          plist_path = os.path.join(app_path, "Info.plist")
+          with open(plist_path, "rb") as f:
+              info_plist = plistlib.load(f)
+          exec_name = info_plist.get("CFBundleExecutable", "GeneralsXZH")
+          exec_path = os.path.join(app_path, exec_name)
+          print("Staging binary:", built_bin, "->", exec_path)
+          safe_copy(built_bin, exec_path)
+          os.chmod(exec_path, 0o755)
+
+          for search_dir in ("build/ios-vulkan", "ios", "references"):
+              if not os.path.isdir(search_dir):
+                  continue
+              for root, dirs, files in os.walk(search_dir):
+                  for fn in files:
+                      if not fn.endswith(".dylib"):
+                          continue
+                      low = fn.lower()
+                      if "moltenvk" in low or "vulkan" in low:
+                          continue
+                      full = os.path.join(root, fn)
+                      if not os.path.isfile(full):
+                          continue
+                      try:
+                          if os.path.getsize(full) == 0:
+                              continue
+                      except OSError:
+                          continue
+                      ft = run(["file", "-L", full], check=False, capture=True)
+                      if "Mach-O" in ft and "arm64" in ft:
+                          safe_copy(full, os.path.join(fw_dir, fn))
+
+          mvk_dylib = None
+          for search_dir in ("build", "ios", "references"):
+              if not os.path.isdir(search_dir):
+                  continue
+              for root, dirs, files in os.walk(search_dir):
+                  if "simulator" in root.lower():
+                      continue
+                  for fn in files:
+                      if fn not in ("libMoltenVK.dylib", "MoltenVK"):
+                          continue
+                      full = os.path.join(root, fn)
+                      if not os.path.isfile(full):
+                          continue
+                      ft = run(["file", "-L", full], check=False, capture=True)
+                      if "dynamically linked shared library arm64" in ft:
+                          vt = run(["vtool", "-show-build", full], check=False, capture=True)
+                          for line in vt.splitlines():
+                              parts = line.strip().split()
+                              if len(parts) >= 2 and parts[0] == "platform" and parts[1].upper() == "IOS":
+                                  mvk_dylib = full
+                                  break
+                      if mvk_dylib:
+                          break
+                  if mvk_dylib:
+                      break
+              if mvk_dylib:
+                  break
+
+          mvk_out = os.path.join(fw_dir, "libMoltenVK.dylib")
+          if mvk_dylib:
+              print("Found existing iOS ARM64 dynamic MoltenVK:", mvk_dylib)
+              safe_copy(mvk_dylib, mvk_out)
+          else:
+              vulkan_sdk = os.environ.get("VULKAN_SDK", "")
+              mvk_static = os.path.join(vulkan_sdk, "lib", "MoltenVK.xcframework", "ios-arm64", "libMoltenVK.a")
+              if not os.path.isfile(mvk_static):
+                  mvk_static = None
+                  for search_dir in (vulkan_sdk, "build", "ios", "references"):
+                      if not search_dir or not os.path.isdir(search_dir):
+                          continue
+                      for root, dirs, files in os.walk(search_dir):
+                          low_root = root.lower()
+                          if "simulator" in low_root:
+                              continue
+                          if "/ios-arm64" not in low_root and not low_root.endswith("ios-arm64"):
+                              continue
+                          if "libMoltenVK.a" in files:
+                              cand = os.path.join(root, "libMoltenVK.a")
+                              if os.path.isfile(cand):
+                                  mvk_static = cand
+                                  break
+                      if mvk_static:
+                          break
+              if not mvk_static:
+                  print("ERROR: Could not find iOS ARM64 libMoltenVK.a")
+                  sys.exit(1)
+              print("Linking dynamic libMoltenVK.dylib from:", mvk_static)
+              ios_sdk = run(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"], capture=True).strip()
+              run([
+                  "clang++", "-shared", "-arch", "arm64",
+                  "-isysroot", ios_sdk,
+                  "-miphoneos-version-min=15.0",
+                  "-Wl,-force_load," + mvk_static,
+                  "-framework", "Metal",
+                  "-framework", "Foundation",
+                  "-framework", "QuartzCore",
+                  "-framework", "UIKit",
+                  "-framework", "IOSurface",
+                  "-framework", "CoreGraphics",
+                  "-framework", "CoreFoundation",
+                  "-weak_framework", "CoreVideo",
+                  "-weak_framework", "MetalFX",
+                  "-install_name", "@rpath/libMoltenVK.dylib",
+                  "-o", mvk_out,
+              ])
+
+          syms = run(["nm", "-gU", mvk_out], check=False, capture=True)
+          found_vk = [ln for ln in syms.splitlines() if "vkGetInstanceProcAddr" in ln]
+          print("MoltenVK exports:", found_vk[:5])
+
+          safe_copy(mvk_out, os.path.join(fw_dir, "libvulkan.1.dylib"))
+          safe_copy(mvk_out, os.path.join(fw_dir, "libvulkan.dylib"))
+
+          mvk_fw = os.path.join(fw_dir, "MoltenVK.framework")
+          if os.path.exists(mvk_fw):
+              shutil.rmtree(mvk_fw)
+          os.makedirs(mvk_fw, exist_ok=True)
+          mvk_fw_bin = os.path.join(mvk_fw, "MoltenVK")
+          safe_copy(mvk_out, mvk_fw_bin)
+          mvk_plist = {
+              "CFBundleExecutable": "MoltenVK",
+              "CFBundleIdentifier": "org.khronos.MoltenVK",
+              "CFBundleInfoDictionaryVersion": "6.0",
+              "CFBundleName": "MoltenVK",
+              "CFBundlePackageType": "FMWK",
+              "CFBundleShortVersionString": "1.0",
+              "CFBundleVersion": "1",
+              "MinimumOSVersion": "15.0",
+              "CFBundleSupportedPlatforms": ["iPhoneOS"],
+          }
+          with open(os.path.join(mvk_fw, "Info.plist"), "wb") as f:
+              plistlib.dump(mvk_plist, f)
+
+          for root, dirs, files in os.walk(fw_dir):
+              for fn in files:
+                  p = os.path.join(root, fn)
+                  if os.path.islink(p):
+                      os.unlink(p)
+                  elif os.path.isfile(p) and os.path.getsize(p) == 0:
+                      os.unlink(p)
+
+          def fix_macho(target, install_id=None):
+              os.chmod(target, 0o755)
+              run(["codesign", "--remove-signature", target], check=False)
+              if install_id:
+                  run(["install_name_tool", "-id", install_id, target], check=False)
+              out_l = run(["otool", "-l", target], check=False, capture=True)
+              lines = out_l.splitlines()
+              for i, ln in enumerate(lines):
+                  if "cmd LC_RPATH" in ln:
+                      for j in range(i + 1, min(i + 5, len(lines))):
+                          if "path " in lines[j]:
+                              rp = lines[j].strip().split()[1]
+                              if rp.startswith("/Users/") or rp.startswith("/opt/"):
+                                  run(["install_name_tool", "-delete_rpath", rp, target], check=False)
+                              break
+              run(["install_name_tool", "-add_rpath", "@executable_path/Frameworks", target], check=False)
+              run(["install_name_tool", "-add_rpath", "@loader_path", target], check=False)
+              out_L = run(["otool", "-L", target], check=False, capture=True)
+              for ln in out_L.splitlines()[1:]:
+                  parts = ln.strip().split()
+                  if not parts:
+                      continue
+                  dep = parts[0]
+                  if dep.startswith("/Users/") or dep.startswith("/opt/"):
+                      dep_base = os.path.basename(dep)
+                      if os.path.isfile(os.path.join(fw_dir, dep_base)):
+                          run(["install_name_tool", "-change", dep, "@rpath/" + dep_base, target], check=False)
+
+          fix_macho(exec_path)
+          for fn in os.listdir(fw_dir):
+              if fn.endswith(".dylib"):
+                  p = os.path.join(fw_dir, fn)
+                  if os.path.isfile(p):
+                      fix_macho(p, "@rpath/" + fn)
+          fix_macho(mvk_fw_bin, "@rpath/MoltenVK.framework/MoltenVK")
+
+          info_plist["UIFileSharingEnabled"] = True
+          info_plist["LSSupportsOpeningDocumentsInPlace"] = True
+          with open(plist_path, "wb") as f:
+              plistlib.dump(info_plist, f)
+
+          if os.path.isdir("ios/config"):
+              for item in os.listdir("ios/config"):
+                  s = os.path.join("ios/config", item)
+                  d = os.path.join(app_path, item)
+                  if os.path.isdir(s):
+                      shutil.copytree(s, d, dirs_exist_ok=True, symlinks=False, ignore_dangling_symlinks=True)
+                  else:
+                      safe_copy(s, d)
+          if os.path.isdir("ios/fonts"):
+              shutil.copytree("ios/fonts", os.path.join(app_path, "fonts"), dirs_exist_ok=True, symlinks=False, ignore_dangling_symlinks=True)
+
+          print("=== Bundled Frameworks ===")
+          for fn in sorted(os.listdir(fw_dir)):
+              p = os.path.join(fw_dir, fn)
+              sz = os.path.getsize(p) if os.path.isfile(p) else 0
+              print(fn, sz)
+
+          if os.path.exists("Payload"):
+              shutil.rmtree("Payload")
+          if os.path.exists("GeneralsZH-unsigned.ipa"):
+              os.unlink("GeneralsZH-unsigned.ipa")
+          os.makedirs("Payload", exist_ok=True)
+          shutil.copytree(app_path, os.path.join("Payload", os.path.basename(app_path)), symlinks=False, ignore_dangling_symlinks=True)
+          run(["zip", "-r", "GeneralsZH-unsigned.ipa", "Payload"])
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeneralsZH-iOS-Unsigned-IPA
+          path: GeneralsZH-unsigned.ipa
