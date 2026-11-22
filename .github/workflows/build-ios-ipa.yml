@@ -20,6 +20,40 @@ jobs:
         run: |
           brew install cmake ninja meson pkgconf xcodegen
 
+      - name: Install LunarG Vulkan SDK
+        run: |
+          VULKAN_VER=$(curl -fsSL https://vulkan.lunarg.com/sdk/latest/mac.txt | tr -d '[:space:]')
+          echo "Installing LunarG Vulkan SDK $VULKAN_VER"
+          SDK_DIR="$HOME/VulkanSDK/$VULKAN_VER"
+          MOUNTED=0
+          if curl -fsSL -o vulkansdk.zip "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/mac/vulkansdk-macos-${VULKAN_VER}.zip"; then
+            unzip -q vulkansdk.zip -d vulkansdk_unpack
+            INSTALLER=$(find vulkansdk_unpack -maxdepth 2 -name "*.app" | head -n 1)
+          else
+            curl -fsSL -o vulkansdk.dmg "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/mac/vulkansdk-macos-${VULKAN_VER}.dmg"
+            hdiutil attach vulkansdk.dmg -mountpoint /Volumes/VulkanSDK
+            MOUNTED=1
+            INSTALLER=$(find /Volumes/VulkanSDK -maxdepth 2 -name "*.app" | head -n 1)
+          fi
+          INSTALLER_BIN=$(find "$INSTALLER/Contents/MacOS" -maxdepth 1 -type f -perm +111 | head -n 1)
+          "$INSTALLER_BIN" --root "$SDK_DIR" --accept-licenses --default-answer --confirm-command install
+          if [ ! -f "$SDK_DIR/macOS/lib/MoltenVK.xcframework/ios-arm64/libMoltenVK.a" ]; then
+            FOUND_XC=$(find "$SDK_DIR" -type d -name "MoltenVK.xcframework" | head -n 1)
+            if [ -z "$FOUND_XC" ]; then
+              "$INSTALLER_BIN" --root "${SDK_DIR}-ios" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.ios || true
+              FOUND_XC=$(find "${SDK_DIR}-ios" -type d -name "MoltenVK.xcframework" | head -n 1)
+            fi
+            if [ -n "$FOUND_XC" ]; then
+              mkdir -p "$SDK_DIR/macOS/lib"
+              cp -a "$FOUND_XC" "$SDK_DIR/macOS/lib/"
+            fi
+          fi
+          [ "$MOUNTED" -eq 1 ] && hdiutil detach /Volumes/VulkanSDK || true
+          ls -la "$SDK_DIR/macOS/lib/MoltenVK.xcframework/ios-arm64/libMoltenVK.a"
+          echo "VULKAN_SDK=$SDK_DIR/macOS" >> "$GITHUB_ENV"
+          echo "VULKAN_SDK_ROOT=$SDK_DIR/macOS" >> "$GITHUB_ENV"
+          echo "$SDK_DIR/macOS/bin" >> "$GITHUB_PATH"
+
       - name: Setup full vcpkg
         run: |
           git clone https://github.com/microsoft/vcpkg "$HOME/vcpkg"
@@ -57,12 +91,22 @@ jobs:
       - name: Stage binaries and package unsigned IPA
         run: |
           APP_PATH=$(find build/ios-xcode/Build/Products/Release-iphoneos -maxdepth 2 -name "*.app" | head -n 1)
-          echo "Found app bundle: $APP_PATH"
+          echo "Found XcodeGen app bundle: $APP_PATH"
           mkdir -p "$APP_PATH/Frameworks"
-          cp -f build/ios-vulkan/GeneralsMD/z_generals "$APP_PATH/" 2>/dev/null || find build/ios-vulkan -name "z_generals" -type f -exec cp -f {} "$APP_PATH/" \;
+
+          BUILT_BIN=$(find build/ios-vulkan -type f \( -name "GeneralsXZH" -o -name "z_generals" \) | head -n 1)
+          EXEC_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || echo "GeneralsXZH")
+          echo "Staging binary $BUILT_BIN to $APP_PATH/$EXEC_NAME"
+          cp -f "$BUILT_BIN" "$APP_PATH/$EXEC_NAME"
+          chmod +x "$APP_PATH/$EXEC_NAME"
+
           find build/ios-vulkan ios -name "MoltenVK.framework" -type d -exec cp -a {} "$APP_PATH/Frameworks/" \; 2>/dev/null || true
-          find build/ios-vulkan -name "libdxvk_*.dylib" -o -name "d3d*.dylib" | while read -r f; do cp -a "$f" "$APP_PATH/Frameworks/"; done
+          find build/ios-vulkan references -name "libdxvk_*.dylib" -o -name "d3d*.dylib" | while read -r f; do cp -a "$f" "$APP_PATH/Frameworks/"; done
           [ -d ios/config ] && cp -a ios/config/. "$APP_PATH/"
+          [ -d ios/fonts ] && cp -a ios/fonts "$APP_PATH/"
+
+          ls -la "$APP_PATH"
+          ls -la "$APP_PATH/Frameworks"
 
           mkdir -p Payload
           cp -a "$APP_PATH" Payload/
