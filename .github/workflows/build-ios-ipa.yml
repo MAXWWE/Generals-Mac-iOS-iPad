@@ -1,0 +1,75 @@
+name: Build GeneralsZH iOS Unsigned IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Init iOS DXVK submodule
+        run: |
+          git submodule update --init references/fbraz3-dxvk
+
+      - name: Install toolchain dependencies
+        run: |
+          brew install cmake ninja meson pkgconf xcodegen
+
+      - name: Setup full vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg "$HOME/vcpkg"
+          "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$HOME/vcpkg" >> "$GITHUB_ENV"
+
+      - name: Fetch MoltenVK and stage fonts
+        run: |
+          ./scripts/build/ios/fetch-moltenvk.sh
+          ./scripts/build/ios/stage-fonts.sh
+
+      - name: Configure and build Zero Hour engine for iOS ARM64
+        run: |
+          cmake --preset ios-vulkan
+          cmake --build build/ios-vulkan --target z_generals
+
+      - name: Build unsigned iOS app bundle
+        run: |
+          cd ios
+          xcodegen generate
+          PROJ=$(find . -maxdepth 1 -name "*.xcodeproj" | head -n 1)
+          SCHEME=$(xcodebuild -list -project "$PROJ" | awk '/Schemes:/{getline; gsub(/^[ \t]+|[ \t]+$/, ""); print; exit}')
+          xcodebuild \
+            -project "$PROJ" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath ../build/ios-xcode \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build
+
+      - name: Stage binaries and package unsigned IPA
+        run: |
+          APP_PATH=$(find build/ios-xcode/Build/Products/Release-iphoneos -maxdepth 2 -name "*.app" | head -n 1)
+          echo "Found app bundle: $APP_PATH"
+          mkdir -p "$APP_PATH/Frameworks"
+          cp -f build/ios-vulkan/GeneralsMD/z_generals "$APP_PATH/" 2>/dev/null || find build/ios-vulkan -name "z_generals" -type f -exec cp -f {} "$APP_PATH/" \;
+          find build/ios-vulkan ios -name "MoltenVK.framework" -type d -exec cp -a {} "$APP_PATH/Frameworks/" \; 2>/dev/null || true
+          find build/ios-vulkan -name "libdxvk_*.dylib" -o -name "d3d*.dylib" | while read -r f; do cp -a "$f" "$APP_PATH/Frameworks/"; done
+          [ -d ios/config ] && cp -a ios/config/. "$APP_PATH/"
+
+          mkdir -p Payload
+          cp -a "$APP_PATH" Payload/
+          zip -r -y GeneralsZH-unsigned.ipa Payload
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeneralsZH-iOS-Unsigned-IPA
+          path: GeneralsZH-unsigned.ipa
