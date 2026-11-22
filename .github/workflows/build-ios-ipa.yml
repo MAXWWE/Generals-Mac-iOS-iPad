@@ -135,22 +135,25 @@ jobs:
                 break
               fi
             fi
-          done < <(find build ios references "$VULKAN_SDK" -maxdepth 6 \( -name "libMoltenVK.dylib" -o -name "MoltenVK" \) -type f 2>/dev/null)
+          done < <(find build ios references "$VULKAN_SDK" -maxdepth 6 ! -path "*simulator*" \( -name "libMoltenVK.dylib" -o -name "MoltenVK" \) -type f 2>/dev/null)
 
           if [ -z "$MVK_DYLIB" ]; then
             MVK_STATIC=""
-            while IFS= read -r candidate; do
-              [ -f "$candidate" ] || continue
-              if file -L "$candidate" | grep -qi "ar archive"; then
-                MVK_STATIC="$candidate"
-                echo "Found static iOS ARM64 MoltenVK: $MVK_STATIC"
-                break
-              fi
-            done < <(find "$VULKAN_SDK" build ios references -maxdepth 6 -path "*/ios-arm64/*" ! -path "*simulator*" \( -name "libMoltenVK.a" -o -name "MoltenVK" \) -type f 2>/dev/null)
+            if [ -f "$VULKAN_SDK/lib/MoltenVK.xcframework/ios-arm64/libMoltenVK.a" ]; then
+              MVK_STATIC="$VULKAN_SDK/lib/MoltenVK.xcframework/ios-arm64/libMoltenVK.a"
+            else
+              while IFS= read -r candidate; do
+                [ -f "$candidate" ] || continue
+                if file -L "$candidate" | grep -qi "ar archive"; then
+                  MVK_STATIC="$candidate"
+                  break
+                fi
+              done < <(find "$VULKAN_SDK" build ios references -maxdepth 6 -path "*/ios-arm64/*" ! -path "*simulator*" \( -name "libMoltenVK.a" -o -name "MoltenVK" \) -type f 2>/dev/null)
+            fi
 
             if [ -n "$MVK_STATIC" ]; then
+              echo "Found static iOS ARM64 MoltenVK: $MVK_STATIC"
               IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-              echo "Linking dynamic libMoltenVK.dylib from $MVK_STATIC"
               clang++ -shared -arch arm64 -isysroot "$IOS_SDK" -miphoneos-version-min=15.0 \
                 -Wl,-force_load,"$MVK_STATIC" \
                 -framework Metal -framework Foundation -framework QuartzCore -framework UIKit \
@@ -182,64 +185,4 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string org.khronos.MoltenVK" "$MVK_PLIST"
           /usr/libexec/PlistBuddy -c "Add :CFBundleInfoDictionaryVersion string 6.0" "$MVK_PLIST"
           /usr/libexec/PlistBuddy -c "Add :CFBundleName string MoltenVK" "$MVK_PLIST"
-          /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string FMWK" "$MVK_PLIST"
-          /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 1.0" "$MVK_PLIST"
-          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 1" "$MVK_PLIST"
-          /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string 15.0" "$MVK_PLIST"
-          /usr/libexec/PlistBuddy -c "Add :CFBundleSupportedPlatforms array" "$MVK_PLIST"
-          /usr/libexec/PlistBuddy -c "Add :CFBundleSupportedPlatforms:0 string iPhoneOS" "$MVK_PLIST"
-
-          # Remove any symlinks or 0-byte files so ESign packaging never fails
-          find "$APP_PATH/Frameworks" -type l -delete 2>/dev/null || true
-          find "$APP_PATH/Frameworks" -type f -size 0 -delete 2>/dev/null || true
-
-          # Fix RPATHs and hardcoded build paths
-          fix_macho() {
-            local target="$1"
-            codesign --remove-signature "$target" 2>/dev/null || true
-            otool -l "$target" | awk '/cmd LC_RPATH/{f=1} f && /path /{print $2; f=0}' | while IFS= read -r rp; do
-              case "$rp" in
-                /Users/*|/opt/*)
-                  install_name_tool -delete_rpath "$rp" "$target" 2>/dev/null || true
-                  ;;
-              esac
-            done
-            install_name_tool -add_rpath "@executable_path/Frameworks" "$target" 2>/dev/null || true
-            install_name_tool -add_rpath "@loader_path" "$target" 2>/dev/null || true
-            otool -L "$target" | awk 'NR>1 {print $1}' | while IFS= read -r dep; do
-              case "$dep" in
-                /Users/*|/opt/*)
-                  dep_base=$(basename "$dep")
-                  if [ -f "$APP_PATH/Frameworks/$dep_base" ]; then
-                    install_name_tool -change "$dep" "@rpath/$dep_base" "$target" 2>/dev/null || true
-                  fi
-                  ;;
-              esac
-            done
-          }
-
-          fix_macho "$APP_PATH/$EXEC_NAME"
-          for d in "$APP_PATH/Frameworks"/*.dylib; do
-            [ -f "$d" ] || continue
-            chmod +w "$d"
-            codesign --remove-signature "$d" 2>/dev/null || true
-            install_name_tool -id "@rpath/$(basename "$d")" "$d" 2>/dev/null || true
-            fix_macho "$d"
-          done
-          chmod +w "$APP_PATH/Frameworks/MoltenVK.framework/MoltenVK"
-          codesign --remove-signature "$APP_PATH/Frameworks/MoltenVK.framework/MoltenVK" 2>/dev/null || true
-          install_name_tool -id "@rpath/MoltenVK.framework/MoltenVK" "$APP_PATH/Frameworks/MoltenVK.framework/MoltenVK" 2>/dev/null || true
-          fix_macho "$APP_PATH/Frameworks/MoltenVK.framework/MoltenVK"
-
-          # Enable iOS Files app folder visibility natively
-          /usr/libexec/PlistBuddy -c "Delete :UIFileSharingEnabled" "$APP_PATH/Info.plist" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$APP_PATH/Info.plist"
-          /usr/libexec/PlistBuddy -c "Delete :LSSupportsOpeningDocumentsInPlace" "$APP_PATH/Info.plist" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$APP_PATH/Info.plist"
-
-          [ -d ios/config ] && cp -RfL ios/config/. "$APP_PATH/" || true
-          [ -d ios/fonts ] && cp -RfL ios/fonts "$APP_PATH/" || true
-
-          echo "=== DXVK Vulkan loader references ==="
-          grep -n -E "dlopen|MoltenVK|vulkan" references/fbraz3-dxvk/src/vulkan/vulkan_loader.cpp 2>/dev/null || true
-          echo "=== Bundled Frameworks ==="
+          /usr/libexec/PlistBuddy -c "Add :CFBundle
