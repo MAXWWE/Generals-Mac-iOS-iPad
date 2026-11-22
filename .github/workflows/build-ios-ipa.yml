@@ -111,17 +111,79 @@ jobs:
           cp -f "$BUILT_BIN" "$APP_PATH/$EXEC_NAME"
           chmod +x "$APP_PATH/$EXEC_NAME"
 
-          find build/ios-vulkan ios -name "MoltenVK.framework" -type d -exec cp -a {} "$APP_PATH/Frameworks/" \; 2>/dev/null || true
-          find build/ios-vulkan references -name "libdxvk_*.dylib" -o -name "d3d*.dylib" | while read -r f; do cp -a "$f" "$APP_PATH/Frameworks/"; done
-          [ -d ios/config ] && cp -a ios/config/. "$APP_PATH/" || true
-          [ -d ios/fonts ] && cp -a ios/fonts "$APP_PATH/" || true
+          # Copy all valid, non-empty ARM64 dylibs (SDL3, SDL3_image, OpenAL, DXVK, etc.) without broken symlinks
+          find build/ios-vulkan ios references -name "*.dylib" 2>/dev/null | while IFS= read -r f; do
+            if [ -f "$f" ] && [ -s "$f" ]; then
+              if file -L "$f" | grep -q "Mach-O.*arm64"; then
+                base=$(basename "$f")
+                cp -fL "$f" "$APP_PATH/Frameworks/$base"
+              fi
+            fi
+          done
 
-          ls -la "$APP_PATH"
-          ls -la "$APP_PATH/Frameworks"
+          # Copy MoltenVK.framework if present
+          find build/ios-vulkan ios -name "MoltenVK.framework" -type d 2>/dev/null | while IFS= read -r fw; do
+            cp -RfL "$fw" "$APP_PATH/Frameworks/"
+          done
 
+          # Remove any symlinks or 0-byte files so ESign packaging never fails
+          find "$APP_PATH/Frameworks" -type l -delete 2>/dev/null || true
+          find "$APP_PATH/Frameworks" -type f -size 0 -delete 2>/dev/null || true
+
+          # Fix RPATHs and hardcoded build paths on main binary and all dylibs
+          fix_macho() {
+            local target="$1"
+            codesign --remove-signature "$target" 2>/dev/null || true
+            otool -l "$target" | awk '/cmd LC_RPATH/{f=1} f && /path /{print $2; f=0}' | while IFS= read -r rp; do
+              case "$rp" in
+                /Users/*|/opt/*)
+                  install_name_tool -delete_rpath "$rp" "$target" 2>/dev/null || true
+                  ;;
+              esac
+            done
+            install_name_tool -add_rpath "@executable_path/Frameworks" "$target" 2>/dev/null || true
+            install_name_tool -add_rpath "@loader_path" "$target" 2>/dev/null || true
+            otool -L "$target" | awk 'NR>1 {print $1}' | while IFS= read -r dep; do
+              case "$dep" in
+                /Users/*|/opt/*)
+                  dep_base=$(basename "$dep")
+                  if [ -f "$APP_PATH/Frameworks/$dep_base" ]; then
+                    install_name_tool -change "$dep" "@rpath/$dep_base" "$target" 2>/dev/null || true
+                  fi
+                  ;;
+              esac
+            done
+          }
+
+          fix_macho "$APP_PATH/$EXEC_NAME"
+          for d in "$APP_PATH/Frameworks"/*.dylib; do
+            [ -f "$d" ] || continue
+            chmod +w "$d"
+            codesign --remove-signature "$d" 2>/dev/null || true
+            install_name_tool -id "@rpath/$(basename "$d")" "$d" 2>/dev/null || true
+            fix_macho "$d"
+          done
+
+          # Enable iOS Files app folder visibility natively
+          /usr/libexec/PlistBuddy -c "Delete :UIFileSharingEnabled" "$APP_PATH/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c "Delete :LSSupportsOpeningDocumentsInPlace" "$APP_PATH/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$APP_PATH/Info.plist"
+
+          [ -d ios/config ] && cp -RfL ios/config/. "$APP_PATH/" || true
+          [ -d ios/fonts ] && cp -RfL ios/fonts "$APP_PATH/" || true
+
+          echo "=== Main binary dependencies ==="
+          otool -L "$APP_PATH/$EXEC_NAME"
+          echo "=== Main binary RPATHs ==="
+          otool -l "$APP_PATH/$EXEC_NAME" | awk '/cmd LC_RPATH/{f=1} f && /path /{print $2; f=0}'
+          echo "=== Bundled Frameworks ==="
+          ls -lh "$APP_PATH/Frameworks"
+
+          rm -rf Payload GeneralsZH-unsigned.ipa
           mkdir -p Payload
-          cp -a "$APP_PATH" Payload/
-          zip -r -y GeneralsZH-unsigned.ipa Payload
+          cp -RfL "$APP_PATH" Payload/
+          zip -r GeneralsZH-unsigned.ipa Payload
 
       - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
