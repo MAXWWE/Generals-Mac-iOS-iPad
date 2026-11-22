@@ -14,7 +14,7 @@ jobs:
 
       - name: Init iOS DXVK submodule
         run: |
-          git submodule update --init references/fbraz3-dxvk
+          git submodule update --init --recursive references/fbraz3-dxvk
 
       - name: Install toolchain dependencies
         run: |
@@ -49,9 +49,20 @@ jobs:
             fi
           fi
           [ "$MOUNTED" -eq 1 ] && hdiutil detach /Volumes/VulkanSDK || true
+          mkdir -p "$SDK_DIR/vulkan-headers-only"
+          VULK_INC=$(find "$SDK_DIR" -path "*/include/vulkan/vulkan.h" -print -quit | sed 's|/vulkan/vulkan.h$||')
+          if [ -n "$VULK_INC" ]; then
+            for d in vulkan vk_video spirv; do
+              if [ -d "$VULK_INC/$d" ]; then
+                cp -a "$VULK_INC/$d" "$SDK_DIR/vulkan-headers-only/"
+              fi
+            done
+          fi
           ls -la "$SDK_DIR/macOS/lib/MoltenVK.xcframework/ios-arm64/libMoltenVK.a"
+          ls -la "$SDK_DIR/vulkan-headers-only/vulkan/vulkan.h"
           echo "VULKAN_SDK=$SDK_DIR/macOS" >> "$GITHUB_ENV"
           echo "VULKAN_SDK_ROOT=$SDK_DIR/macOS" >> "$GITHUB_ENV"
+          echo "CPATH=$SDK_DIR/vulkan-headers-only" >> "$GITHUB_ENV"
           echo "$SDK_DIR/macOS/bin" >> "$GITHUB_PATH"
 
       - name: Setup full vcpkg
@@ -102,8 +113,8 @@ jobs:
 
           find build/ios-vulkan ios -name "MoltenVK.framework" -type d -exec cp -a {} "$APP_PATH/Frameworks/" \; 2>/dev/null || true
           find build/ios-vulkan references -name "libdxvk_*.dylib" -o -name "d3d*.dylib" | while read -r f; do cp -a "$f" "$APP_PATH/Frameworks/"; done
-          [ -d ios/config ] && cp -a ios/config/. "$APP_PATH/"
-          [ -d ios/fonts ] && cp -a ios/fonts "$APP_PATH/"
+          [ -d ios/config ] && cp -a ios/config/. "$APP_PATH/" || true
+          [ -d ios/fonts ] && cp -a ios/fonts "$APP_PATH/" || true
 
           ls -la "$APP_PATH"
           ls -la "$APP_PATH/Frameworks"
