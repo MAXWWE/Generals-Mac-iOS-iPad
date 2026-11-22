@@ -50,7 +50,7 @@ jobs:
           fi
           [ "$MOUNTED" -eq 1 ] && hdiutil detach /Volumes/VulkanSDK || true
           mkdir -p "$SDK_DIR/vulkan-headers-only"
-          VULK_INC=$(find "$SDK_DIR" -path "*/include/vulkan/vulkan.h" -print -quit | sed 's|/vulkan/vulkan.h$||')
+          VULK_INC=$(find "$SDK_DIR" -path "*/include/vulkan/vulkan.h" -print -quit \vert{} sed 's\vert{}/vulkan/vulkan.h$||')
           if [ -n "$VULK_INC" ]; then
             for d in vulkan vk_video spirv; do
               if [ -d "$VULK_INC/$d" ]; then
@@ -86,7 +86,7 @@ jobs:
           cd ios
           xcodegen generate
           PROJ=$(find . -maxdepth 1 -name "*.xcodeproj" | head -n 1)
-          SCHEME=$(xcodebuild -list -project "$PROJ" | awk '/Schemes:/{getline; gsub(/^[ \t]+|[ \t]+$/, ""); print; exit}')
+          SCHEME=$(xcodebuild -list -project "$PROJ" \vert{} awk '/Schemes:/{getline; gsub(/^[ \t]+\vert{}[ \t]+$/, ""); print; exit}')
           xcodebuild \
             -project "$PROJ" \
             -scheme "$SCHEME" \
@@ -129,7 +129,7 @@ jobs:
           while IFS= read -r candidate; do
             [ -f "$candidate" ] || continue
             if file -L "$candidate" | grep -q "dynamically linked shared library arm64"; then
-              if vtool -show-build "$candidate" 2>/dev/null | grep -qiE "platform[[:space:]]+IOS([[:space:]]|$)"; then
+              if vtool -show-build "$candidate" 2>/dev/null \vert{} grep -qiE "platform[[:space:]]+IOS([[:space:]]\vert{}$)"; then
                 MVK_DYLIB="$candidate"
                 echo "Found existing iOS ARM64 dynamic MoltenVK: $MVK_DYLIB"
                 break
@@ -146,7 +146,7 @@ jobs:
                 echo "Found static iOS ARM64 MoltenVK: $MVK_STATIC"
                 break
               fi
-            done < <(find "$VULKAN_SDK" build ios references -maxdepth 6 -path "*ios-arm64*" \( -name "libMoltenVK.a" -o -name "MoltenVK" \) -type f 2>/dev/null)
+            done < <(find "$VULKAN_SDK" build ios references -maxdepth 6 -path "*/ios-arm64/*" ! -path "*simulator*" \( -name "libMoltenVK.a" -o -name "MoltenVK" \) -type f 2>/dev/null)
 
             if [ -n "$MVK_STATIC" ]; then
               IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -156,7 +156,6 @@ jobs:
                 -framework Metal -framework Foundation -framework QuartzCore -framework UIKit \
                 -framework IOSurface -framework CoreGraphics -framework CoreFoundation \
                 -weak_framework CoreVideo -weak_framework MetalFX \
-                -lc++ \
                 -install_name "@rpath/libMoltenVK.dylib" \
                 -o "$APP_PATH/Frameworks/libMoltenVK.dylib"
             else
@@ -244,15 +243,3 @@ jobs:
           echo "=== DXVK Vulkan loader references ==="
           grep -n -E "dlopen|MoltenVK|vulkan" references/fbraz3-dxvk/src/vulkan/vulkan_loader.cpp 2>/dev/null || true
           echo "=== Bundled Frameworks ==="
-          ls -lh "$APP_PATH/Frameworks"
-
-          rm -rf Payload GeneralsZH-unsigned.ipa
-          mkdir -p Payload
-          cp -RfL "$APP_PATH" Payload/
-          zip -r GeneralsZH-unsigned.ipa Payload
-
-      - name: Upload unsigned IPA artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: GeneralsZH-iOS-Unsigned-IPA
-          path: GeneralsZH-unsigned.ipa
